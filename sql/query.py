@@ -7,14 +7,14 @@ import traceback
 
 import simplejson as json
 from django.contrib.auth.decorators import permission_required
-from django.core import serializers
-from django.db import connection, OperationalError
+from django.db import connection, close_old_connections
 from django.db.models import Q
 from django.http import HttpResponse
 from common.config import SysConfig
-from common.utils.extend_json_encoder import ExtendJSONEncoder
+from common.utils.extend_json_encoder import ExtendJSONEncoder, ExtendJSONEncoderFTime
 from common.utils.timer import FuncTimer
 from sql.query_privileges import query_priv_check
+from sql.utils.resource_group import user_instances
 from sql.utils.tasks import add_kill_conn_schedule, del_schedule
 from .models import QueryLog, Instance
 from sql.engines import get_engine
@@ -32,16 +32,18 @@ def query(request):
     instance_name = request.POST.get('instance_name')
     sql_content = request.POST.get('sql_content')
     db_name = request.POST.get('db_name')
+    tb_name = request.POST.get('tb_name')
     limit_num = int(request.POST.get('limit_num', 0))
+    schema_name = request.POST.get('schema_name', None)
     user = request.user
 
     result = {'status': 0, 'msg': 'ok', 'data': {}}
     try:
-        instance = Instance.objects.get(instance_name=instance_name)
+        instance = user_instances(request.user).get(instance_name=instance_name)
     except Instance.DoesNotExist:
         result['status'] = 1
-        result['msg'] = '实例不存在'
-        return result
+        result['msg'] = '你所在组未关联该实例'
+        return HttpResponse(json.dumps(result), content_type='application/json')
 
     # 服务器端参数验证
     if None in [sql_content, db_name, instance_name, limit_num]:
@@ -72,7 +74,7 @@ def query(request):
             limit_num = priv_check_info['data']['limit_num']
             priv_check = priv_check_info['data']['priv_check']
         else:
-            result['status'] = 1
+            result['status'] = priv_check_info['status']
             result['msg'] = priv_check_info['msg']
             return HttpResponse(json.dumps(result), content_type='application/json')
         # explain的limit_num设置为0
@@ -91,7 +93,12 @@ def query(request):
             run_date = (datetime.datetime.now() + datetime.timedelta(seconds=max_execution_time))
             add_kill_conn_schedule(schedule_name, run_date, instance.id, thread_id)
         with FuncTimer() as t:
-            query_result = query_engine.query(db_name, sql_content, limit_num)
+            # 获取主从延迟信息
+            seconds_behind_master = query_engine.seconds_behind_master
+            query_result = query_engine.query(db_name, sql_content, limit_num,
+                                              schema_name=schema_name,
+                                              tb_name=tb_name,
+                                              max_execution_time=max_execution_time * 1000)
         query_result.query_time = t.cost
         # 返回查询结果后删除schedule
         if thread_id:
@@ -115,23 +122,21 @@ def query(request):
                         result['msg'] = f'数据脱敏异常：{masking_result.error}'
                     # 关闭query_check，忽略错误信息，返回未脱敏数据，权限校验标记为跳过
                     else:
+                        logger.warning(f'数据脱敏异常，按照配置放行，查询语句：{sql_content}，错误信息：{masking_result.error}')
                         query_result.error = None
-                        priv_check = False
                         result['data'] = query_result.__dict__
-                    logger.error(f'数据脱敏异常，查询语句：{sql_content}\n，错误信息：{masking_result.error}')
                 # 正常脱敏
                 else:
                     result['data'] = masking_result.__dict__
             except Exception as msg:
-                logger.error(f'数据脱敏异常，查询语句：{sql_content}\n，错误信息：{msg}')
                 # 抛出未定义异常，并且开启query_check，直接返回异常，禁止执行
                 if config.get('query_check'):
                     result['status'] = 1
                     result['msg'] = f'数据脱敏异常，请联系管理员，错误信息：{msg}'
                 # 关闭query_check，忽略错误信息，返回未脱敏数据，权限校验标记为跳过
                 else:
+                    logger.warning(f'数据脱敏异常，按照配置放行，查询语句：{sql_content}，错误信息：{msg}')
                     query_result.error = None
-                    priv_check = False
                     result['data'] = query_result.__dict__
         # 无需脱敏的语句
         else:
@@ -139,8 +144,7 @@ def query(request):
 
         # 仅将成功的查询语句记录存入数据库
         if not query_result.error:
-            if hasattr(query_engine, 'seconds_behind_master'):
-                result['data']['seconds_behind_master'] = query_engine.seconds_behind_master
+            result['data']['seconds_behind_master'] = seconds_behind_master
             if int(limit_num) == 0:
                 limit_num = int(query_result.affected_rows)
             else:
@@ -158,11 +162,9 @@ def query(request):
                 masking=query_result.is_masked
             )
             # 防止查询超时
-            try:
-                query_log.save()
-            except OperationalError:
-                connection.close()
-                query_log.save()
+            if connection.connection and not connection.is_usable():
+                close_old_connections()
+            query_log.save()
     except Exception as e:
         logger.error(f'查询异常报错，查询语句：{sql_content}\n，错误信息：{traceback.format_exc()}')
         result['status'] = 1
@@ -170,7 +172,7 @@ def query(request):
         return HttpResponse(json.dumps(result), content_type='application/json')
     # 返回查询结果
     try:
-        return HttpResponse(json.dumps(result, cls=ExtendJSONEncoder, bigint_as_string=True),
+        return HttpResponse(json.dumps(result, use_decimal=False, cls=ExtendJSONEncoderFTime, bigint_as_string=True),
                             content_type='application/json')
     # 虽然能正常返回，但是依然会乱码
     except UnicodeDecodeError:
@@ -248,3 +250,4 @@ def kill_query_conn(instance_id, thread_id):
     instance = Instance.objects.get(pk=instance_id)
     query_engine = get_engine(instance)
     query_engine.kill_connection(thread_id)
+

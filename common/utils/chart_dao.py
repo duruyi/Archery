@@ -5,22 +5,21 @@ from django.db import connection
 
 
 class ChartDao(object):
-    # 直接在archery数据库查询数据，用于报表
+    # 直接在Archery数据库查询数据，用于报表
     @staticmethod
     def __query(sql):
         cursor = connection.cursor()
-        effect_row = cursor.execute(sql)
+        cursor.execute(sql)
         rows = cursor.fetchall()
         fields = cursor.description
         column_list = []
         if fields:
             for i in fields:
                 column_list.append(i[0])
-        result = {}
-        result['column_list'] = column_list
-        result['rows'] = rows
-        result['effect_row'] = effect_row
-        return result
+        return {
+            'column_list': column_list,
+            'rows': rows
+        }
 
     # 获取连续时间
     @staticmethod
@@ -40,6 +39,7 @@ class ChartDao(object):
             then 'DDL'
           when syntax_type = 2
             then 'DML'
+          else '其他'
           end as syntax_type,
           count(*)
         from sql_workflow
@@ -131,4 +131,44 @@ class ChartDao(object):
         group by db_name
         order by sum(effect_row) desc
         limit 10;'''.format(cycle)
+        return self.__query(sql)
+
+    # 慢日志历史趋势图(按次数)
+    def slow_query_review_history_by_cnt(self, checksum):
+        sql = f"""select sum(ts_cnt),date(date_add(ts_min, interval 8 HOUR))
+from mysql_slow_query_review_history
+where checksum = '{checksum}'
+group by date(date_add(ts_min, interval 8 HOUR));"""
+        return self.__query(sql)
+
+    # 慢日志历史趋势图(按时长)
+    def slow_query_review_history_by_pct_95_time(self, checksum):
+        sql = f"""select truncate(Query_time_pct_95,6),date(date_add(ts_min, interval 8 HOUR))
+from mysql_slow_query_review_history
+where checksum = '{checksum}'
+group by date(date_add(ts_min, interval 8 HOUR));"""
+        return self.__query(sql)
+
+    # 慢日志db/user维度统计
+    def slow_query_count_by_db_by_user(self, cycle):
+        sql = '''
+        select
+            concat(db_max,' user: ' ,user_max),
+            sum(ts_cnt) 
+        from mysql_slow_query_review_history 
+        where ts_min >= date_sub(now(), interval {} day) 
+        group by db_max,user_max order by sum(ts_cnt) desc limit 50;
+        '''.format(cycle)
+        return self.__query(sql)
+
+    # 慢日志db维度统计
+    def slow_query_count_by_db(self, cycle):
+        sql = '''
+        select
+            db_max,
+            sum(ts_cnt) 
+        from mysql_slow_query_review_history 
+        where ts_min >= date_sub(now(), interval {} day) 
+        group by db_max order by sum(ts_cnt) desc limit 50;
+        '''.format(cycle)
         return self.__query(sql)

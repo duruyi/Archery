@@ -1,3 +1,5 @@
+import MySQLdb
+
 import simplejson as json
 from django.contrib.auth.decorators import permission_required
 
@@ -5,6 +7,7 @@ from django.http import HttpResponse
 
 from sql.engines import get_engine
 from common.utils.extend_json_encoder import ExtendJSONEncoder
+from sql.utils.resource_group import user_instances
 from .models import AliyunRdsConfig, Instance
 
 from .aliyun_rds import process_status as aliyun_process_status, create_kill_session as aliyun_create_kill_session, \
@@ -18,16 +21,19 @@ def process(request):
     command_type = request.POST.get('command_type')
 
     try:
-        instance = Instance.objects.get(instance_name=instance_name)
+        instance = user_instances(request.user, db_type=['mysql']).get(instance_name=instance_name)
     except Instance.DoesNotExist:
-        result = {'status': 1, 'msg': '实例不存在', 'data': []}
+        result = {'status': 1, 'msg': '你所在组未关联该实例', 'data': []}
         return HttpResponse(json.dumps(result), content_type='application/json')
 
     base_sql = "select id, user, host, db, command, time, state, ifnull(info,'') as info from information_schema.processlist"
     # 判断是RDS还是其他实例
-    if len(AliyunRdsConfig.objects.filter(instance=instance, is_enable=True)) > 0:
+    if AliyunRdsConfig.objects.filter(instance=instance, is_enable=True).exists():
         result = aliyun_process_status(request)
     else:
+        # escape
+        command_type = MySQLdb.escape_string(command_type).decode('utf-8')
+
         if command_type == 'All':
             sql = base_sql + ";"
         elif command_type == 'Not Sleep':
@@ -35,10 +41,12 @@ def process(request):
         else:
             sql = "{} where command= '{}';".format(base_sql, command_type)
         query_engine = get_engine(instance=instance)
-        processlist = query_engine.query('information_schema', sql).to_dict()
-
-        result = {'status': 0, 'msg': 'ok', 'rows': processlist}
-
+        query_result = query_engine.query('information_schema', sql)
+        if not query_result.error:
+            processlist = query_result.to_dict()
+            result = {'status': 0, 'msg': 'ok', 'rows': processlist}
+        else:
+            result = {'status': 1, 'msg': query_result.error}
     # 返回查询结果
     return HttpResponse(json.dumps(result, cls=ExtendJSONEncoder, bigint_as_string=True),
                         content_type='application/json')
@@ -51,19 +59,20 @@ def create_kill_session(request):
     thread_ids = request.POST.get('ThreadIDs')
 
     try:
-        instance = Instance.objects.get(instance_name=instance_name)
+        instance = user_instances(request.user, db_type=['mysql']).get(instance_name=instance_name)
     except Instance.DoesNotExist:
-        result = {'status': 1, 'msg': '实例不存在', 'data': []}
+        result = {'status': 1, 'msg': '你所在组未关联该实例', 'data': []}
         return HttpResponse(json.dumps(result), content_type='application/json')
 
     result = {'status': 0, 'msg': 'ok', 'data': []}
     # 判断是RDS还是其他实例
-    if len(AliyunRdsConfig.objects.filter(instance=instance, is_enable=True)) > 0:
+    if AliyunRdsConfig.objects.filter(instance=instance, is_enable=True).exists():
         result = aliyun_create_kill_session(request)
     else:
-        thread_ids = thread_ids.replace('[', '').replace(']', '')
+        thread_ids = json.loads(thread_ids)
         query_engine = get_engine(instance=instance)
-        sql = "select concat('kill ', id, ';') from information_schema.processlist where id in ({});".format(thread_ids)
+        sql = "select concat('kill ', id, ';') from information_schema.processlist where id in ({});"\
+            .format(','.join(str(tid) for tid in thread_ids))
         all_kill_sql = query_engine.query('information_schema', sql)
         kill_sql = ''
         for row in all_kill_sql.rows:
@@ -78,22 +87,28 @@ def create_kill_session(request):
 @permission_required('sql.process_kill', raise_exception=True)
 def kill_session(request):
     instance_name = request.POST.get('instance_name')
-    request_params = request.POST.get('request_params')
+    thread_ids = request.POST.get('ThreadIDs')
     result = {'status': 0, 'msg': 'ok', 'data': []}
 
     try:
-        instance = Instance.objects.get(instance_name=instance_name)
+        instance = user_instances(request.user, db_type=['mysql']).get(instance_name=instance_name)
     except Instance.DoesNotExist:
-        result = {'status': 1, 'msg': '实例不存在', 'data': []}
+        result = {'status': 1, 'msg': '你所在组未关联该实例', 'data': []}
         return HttpResponse(json.dumps(result), content_type='application/json')
 
     # 判断是RDS还是其他实例
-    if len(AliyunRdsConfig.objects.filter(instance=instance, is_enable=True)) > 0:
+    if AliyunRdsConfig.objects.filter(instance=instance, is_enable=True).exists():
         result = aliyun_kill_session(request)
     else:
-        kill_sql = request_params
-        execute_engine = get_engine(instance=instance)
-        execute_engine.execute('information_schema', kill_sql)
+        thread_ids = json.loads(thread_ids)
+        engine = get_engine(instance=instance)
+        sql = "select concat('kill ', id, ';') from information_schema.processlist where id in ({});"\
+            .format(','.join(str(tid) for tid in thread_ids))
+        all_kill_sql = engine.query('information_schema', sql)
+        kill_sql = ''
+        for row in all_kill_sql.rows:
+            kill_sql = kill_sql + row[0]
+        engine.execute('information_schema', kill_sql)
 
     # 返回查询结果
     return HttpResponse(json.dumps(result, cls=ExtendJSONEncoder, bigint_as_string=True),
@@ -106,13 +121,13 @@ def tablesapce(request):
     instance_name = request.POST.get('instance_name')
 
     try:
-        instance = Instance.objects.get(instance_name=instance_name)
+        instance = user_instances(request.user, db_type=['mysql']).get(instance_name=instance_name)
     except Instance.DoesNotExist:
-        result = {'status': 1, 'msg': '实例不存在', 'data': []}
+        result = {'status': 1, 'msg': '你所在组未关联该实例', 'data': []}
         return HttpResponse(json.dumps(result), content_type='application/json')
 
     # 判断是RDS还是其他实例
-    if len(AliyunRdsConfig.objects.filter(instance=instance, is_enable=True)) > 0:
+    if AliyunRdsConfig.objects.filter(instance=instance, is_enable=True).exists():
         result = aliyun_sapce_status(request)
     else:
         sql = '''
@@ -149,9 +164,9 @@ def trxandlocks(request):
     instance_name = request.POST.get('instance_name')
 
     try:
-        instance = Instance.objects.get(instance_name=instance_name)
+        instance = user_instances(request.user, db_type=['mysql']).get(instance_name=instance_name)
     except Instance.DoesNotExist:
-        result = {'status': 1, 'msg': '实例不存在', 'data': []}
+        result = {'status': 1, 'msg': '你所在组未关联该实例', 'data': []}
         return HttpResponse(json.dumps(result), content_type='application/json')
 
     query_engine = get_engine(instance=instance)
@@ -218,6 +233,59 @@ def trxandlocks(request):
     if not query_result.error:
         trxandlocks = query_result.to_dict()
         result = {'status': 0, 'msg': 'ok', 'rows': trxandlocks}
+    else:
+        result = {'status': 1, 'msg': query_result.error}
+
+    # 返回查询结果
+    return HttpResponse(json.dumps(result, cls=ExtendJSONEncoder, bigint_as_string=True),
+                        content_type='application/json')
+
+
+# 问题诊断--长事务
+@permission_required('sql.trx_view', raise_exception=True)
+def innodb_trx(request):
+    instance_name = request.POST.get('instance_name')
+
+    try:
+        instance = user_instances(request.user, db_type=['mysql']).get(instance_name=instance_name)
+    except Instance.DoesNotExist:
+        result = {'status': 1, 'msg': '你所在组未关联该实例', 'data': []}
+        return HttpResponse(json.dumps(result), content_type='application/json')
+
+    query_engine = get_engine(instance=instance)
+    sql = '''select trx.trx_started,
+       trx.trx_state,
+       trx.trx_operation_state,
+       trx.trx_mysql_thread_id,
+       trx.trx_tables_locked,
+       trx.trx_rows_locked,
+       trx.trx_rows_modified,
+       trx.trx_is_read_only,
+       trx.trx_isolation_level,
+      p.user,
+      p.host,
+      p.db,
+      TO_SECONDS(NOW()) - TO_SECONDS(trx.trx_started) trx_idle_time,
+      p.time thread_time,
+      IFNULL((SELECT
+       GROUP_CONCAT(t1.sql_text SEPARATOR ';
+      ')
+    FROM performance_schema.events_statements_history t1
+      INNER JOIN performance_schema.threads t2
+        ON t1.thread_id = t2.thread_id
+    WHERE t2.PROCESSLIST_ID = p.id), '') info
+FROM information_schema.INNODB_TRX trx
+  INNER JOIN information_schema.PROCESSLIST p
+    ON trx.trx_mysql_thread_id = p.id
+    WHERE trx.trx_state = 'RUNNING'
+    AND p.COMMAND = 'Sleep'
+    AND p.time > 3
+    ORDER BY trx.trx_started ASC;'''
+
+    query_result = query_engine.query('information_schema', sql)
+    if not query_result.error:
+        trx = query_result.to_dict()
+        result = {'status': 0, 'msg': 'ok', 'rows': trx}
     else:
         result = {'status': 1, 'msg': query_result.error}
 

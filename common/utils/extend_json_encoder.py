@@ -1,6 +1,7 @@
 # -*- coding: UTF-8 -*-
 import simplejson as json
 
+from decimal import Decimal
 from datetime import datetime, date, timedelta
 from functools import singledispatch
 
@@ -22,12 +23,22 @@ def _(o):
 
 @convert.register(timedelta)
 def _(o):
-    return o.total_seconds()
+    return o.__str__()
 
 
-# @convert.register(Decimal)
-# def _(o):
-#     return float(o)
+@convert.register(Decimal)
+def _(o):
+    return str(o)
+
+
+@convert.register(memoryview)
+def _(o):
+    return str(o)
+
+
+@convert.register(set)
+def _(o):
+    return list(o)
 
 
 class ExtendJSONEncoder(json.JSONEncoder):
@@ -36,3 +47,15 @@ class ExtendJSONEncoder(json.JSONEncoder):
             return convert(obj)
         except TypeError:
             return super(ExtendJSONEncoder, self).default(obj)
+
+
+class ExtendJSONEncoderFTime(json.JSONEncoder):
+
+    def default(self, obj):
+        try:
+            if isinstance(obj, datetime):
+                return obj.isoformat(' ')
+            else:
+                return convert(obj)
+        except TypeError:
+            return super(ExtendJSONEncoderFTime, self).default(obj)
